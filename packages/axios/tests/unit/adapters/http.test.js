@@ -19,6 +19,7 @@ import httpAdapter, {
 import HttpsProxyAgent from 'https-proxy-agent';
 import http from 'http';
 import https from 'https';
+import http2 from 'http2';
 import net from 'net';
 import stream from 'stream';
 import zlib from 'zlib';
@@ -6597,6 +6598,35 @@ describe('supports http with nodejs', () => {
           }
         }
       );
+
+      it('should close h2c sessions cancelled before they connect', async () => {
+        const server = http2.createServer((req, res) => res.end('OK'));
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        const openSessions = new Set();
+        server.on('session', (session) => {
+          openSessions.add(session);
+          session.once('close', () => openSessions.delete(session));
+        });
+
+        try {
+          for (let i = 0; i < 10; i++) {
+            const controller = new AbortController();
+            const request = axios.get(`http://127.0.0.1:${server.address().port}`, {
+              httpVersion: 2,
+              signal: controller.signal,
+              http2Options: { sessionTimeout: 100, maxSessionMemory: 10 + i },
+            });
+            setImmediate(() => controller.abort());
+            await assert.rejects(request, { code: AxiosError.ERR_CANCELED });
+          }
+
+          await setTimeoutAsync(1000);
+          assert.strictEqual(openSessions.size, 0);
+        } finally {
+          openSessions.forEach((session) => session.destroy());
+          await new Promise((resolve) => server.close(resolve));
+        }
+      });
     });
   });
 

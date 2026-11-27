@@ -1454,7 +1454,7 @@ export default isHttpAdapterSupported &&
 
       abortEmitter.once('abort', (err) => {
         if (req.close) {
-          req.close();
+          req.close(http2.constants.NGHTTP2_CANCEL);
         } else {
           req.destroy(err);
         }
