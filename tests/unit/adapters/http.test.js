@@ -18,6 +18,7 @@ import httpAdapter, {
 import HttpsProxyAgent from 'https-proxy-agent';
 import http from 'http';
 import https from 'https';
+import http2 from 'http2';
 import net from 'net';
 import stream from 'stream';
 import zlib from 'zlib';
@@ -6639,6 +6640,83 @@ describe('supports http with nodejs', () => {
           }
         }
       );
+
+      describe('cancelled before the session connects', () => {
+        const cancelMethods = {
+          AbortController: () => {
+            const controller = new AbortController();
+            return { config: { signal: controller.signal }, cancel: () => controller.abort() };
+          },
+          CancelToken: () => {
+            const source = axios.CancelToken.source();
+            return { config: { cancelToken: source.token }, cancel: () => source.cancel() };
+          },
+        };
+
+        for (const [method, createCanceler] of Object.entries(cancelMethods)) {
+          it(
+            `should close the session after ${method} cancellation`,
+            { timeout: 10000 },
+            async () => {
+              const REQUESTS = 20;
+              const SESSION_TIMEOUT = 300;
+              const clientSessions = new Set();
+              const serverSessions = new Set();
+              const originalConnect = http2.connect;
+
+              http2.connect = function (...args) {
+                const session = originalConnect.apply(this, args);
+                clientSessions.add(session);
+                session.once('close', () => clientSessions.delete(session));
+                return session;
+              };
+
+              // startHTTPServer only creates TLS HTTP/2 servers. The leak needs a
+              // cleartext (h2c) session: Node never finishes closing an h2c session
+              // whose pending stream was closed with NGHTTP2_NO_ERROR.
+              const server = http2.createServer((req, res) => res.end('OK'));
+              server.on('session', (session) => {
+                serverSessions.add(session);
+                session.once('close', () => serverSessions.delete(session));
+              });
+
+              try {
+                await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+                const localServerURL = `http://127.0.0.1:${server.address().port}`;
+
+                for (let i = 0; i < REQUESTS; i++) {
+                  const { config, cancel } = createCanceler();
+                  const request = axios.get(localServerURL, {
+                    ...config,
+                    httpVersion: 2,
+                    proxy: false,
+                    // A distinct option value makes each request open its own session.
+                    http2Options: { sessionTimeout: SESSION_TIMEOUT, maxSessionMemory: 10 + i },
+                  });
+
+                  setImmediate(cancel);
+
+                  await assert.rejects(request, (err) => {
+                    assert.strictEqual(err.code, AxiosError.ERR_CANCELED);
+                    return true;
+                  });
+                }
+
+                await setTimeoutAsync(SESSION_TIMEOUT + 700);
+
+                assert.strictEqual(clientSessions.size, 0, 'client sessions left open');
+                assert.strictEqual(serverSessions.size, 0, 'server sessions left open');
+              } finally {
+                http2.connect = originalConnect;
+                for (const session of [...clientSessions, ...serverSessions]) {
+                  session.destroy();
+                }
+                await new Promise((resolve) => server.close(resolve));
+              }
+            }
+          );
+        }
+      });
     });
   });
 
